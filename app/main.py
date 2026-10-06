@@ -21,8 +21,9 @@ app = FastAPI(
     description=("双时间维（适用时间 / 发布时间）规程版本库：首次发布、更正、"
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
                  "两知悉时刻区间对比、作业规程包的固定/取回/复核、前置规程"
-                 "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性），"
-                 "以及多条更正正式提交前的只读批量预演（不写历史、不占版本号）。"),
+                 "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性）、"
+                 "多条更正正式提交前的只读批量预演（不写历史、不占版本号），"
+                 "以及值班审计事件流（按提交顺序游标分页，整批不拆开、不漏不重）。"),
 )
 
 
@@ -67,6 +68,7 @@ def index() -> dict:
                 "POST /api/v1/corrections",
                 "POST /api/v1/corrections/preview",
                 "POST /api/v1/withdrawals",
+                "GET  /api/v1/audit/events",
                 "GET  /api/v1/effective",
                 "GET  /api/v1/procedures/{number}/history",
                 "GET  /api/v1/procedures/{number}/diff",
@@ -150,6 +152,27 @@ async def create_withdrawal(request: Request) -> dict:
 def effective(work_time: str, known_as_of: str | None = None) -> dict:
     """回溯查询：截至 known_as_of 已发布、且在 work_time 有效的正文与版本。"""
     return service.query_effective(work_time, known_as_of)
+
+
+@app.get("/api/v1/audit/events")
+def audit_events(cursor: str | None = None, limit: str | None = None) -> dict:
+    """值班审计事件流：按提交顺序增量取回全站规程变动。
+
+    - ``cursor``：上一页返回的 ``next_cursor``；省略或传 ``0`` 从起始读取
+      （升级前已有的版本与撤回记录也在起始序列中，按单条事件完整可读）。
+    - ``limit``：本页事件上限（1..1000，默认 100）；分页以完整提交批次为
+      最小单位——同一新提交批次按请求顺序排列、绝不跨页拆开，因此实际
+      返回条数可能少于 limit。
+    - 两参均按字符串接收、由领域层统一校验：非数字等非法形状与越界返回
+      同一套稳定错误码，而不是框架的 validation_error。
+    - 返回事件（``op``：release/correction/withdrawal，含规程编号、版本号、
+      服务端时刻 ``event_at``）、``next_cursor`` 与 ``has_more``。
+    - 游标非法 -> 422 invalid_cursor；limit 非法 -> 422 invalid_page_limit；
+      limit 装不下下一完整批次 -> 422 page_limit_too_small
+      （details 带 required_limit，调大后用同一游标重试）。
+    - 空页保持游标不变（``next_cursor == cursor``、``has_more=false``）。
+    """
+    return service.list_audit_events(cursor, limit)
 
 
 @app.get("/api/v1/procedures/{number}/history")

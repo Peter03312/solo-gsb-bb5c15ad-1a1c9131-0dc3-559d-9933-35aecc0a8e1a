@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -39,7 +40,13 @@ def reset_db() -> None:
         conn.executescript(
             "DELETE FROM prerequisites; "
             "DELETE FROM package_items; DELETE FROM packages; "
+            "DELETE FROM audit_events; DELETE FROM audit_commits; "
+            "DELETE FROM withdrawals; "
             "DELETE FROM versions; DELETE FROM procedures;")
+        if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='sqlite_sequence'").fetchone():
+            conn.execute("DELETE FROM sqlite_sequence")
         conn.commit()
     finally:
         conn.close()
@@ -1774,6 +1781,318 @@ class CorrectionPreviewTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "expired_base_version")
 
 
+class AuditEventTests(unittest.TestCase):
+    """值班审计事件流：提交顺序、整批不拆开、游标分页、补录与并发不漏不重。"""
+
+    def setUp(self):
+        reset_db()
+
+    def _ops(self, res):
+        return [(e["op"], e["number"], e["revision"]) for e in res["events"]]
+
+    def test_empty_db_keeps_cursor_zero(self):
+        res = service.list_audit_events()
+        self.assertEqual(res["events"], [])
+        self.assertEqual(res["count"], 0)
+        self.assertEqual(res["cursor"], 0)
+        self.assertEqual(res["next_cursor"], 0)
+        self.assertFalse(res["has_more"])
+        # 显式起始游标同样得到空页、游标不变
+        res = service.list_audit_events("0")
+        self.assertEqual(res["next_cursor"], 0)
+        self.assertFalse(res["has_more"])
+
+    def test_events_follow_commit_order_with_fields(self):
+        r1 = release("AUD-1")
+        service.publish_releases([item("AUD-2"), item("AUD-3")])
+        c1 = correct("AUD-1", 0, t2, t3, "更正")
+        w1 = withdraw("AUD-1", 1)
+
+        res = service.list_audit_events(0, 100)
+        self.assertFalse(res["has_more"])
+        self.assertEqual(self._ops(res), [
+            ("release", "AUD-1", 0),
+            ("release", "AUD-2", 0),
+            ("release", "AUD-3", 0),
+            ("correction", "AUD-1", 1),
+            ("withdrawal", "AUD-1", 1),
+        ])
+        seqs = [e["seq"] for e in res["events"]]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(seqs, list(range(1, 6)))
+        self.assertEqual(res["next_cursor"], 5)
+
+        by_key = {(e["op"], e["number"], e["revision"]): e
+                  for e in res["events"]}
+        self.assertEqual(
+            by_key[("release", "AUD-1", 0)]["event_at"],
+            r1["published_at"])
+        self.assertEqual(
+            by_key[("correction", "AUD-1", 1)]["event_at"],
+            c1["published_at"])
+        self.assertEqual(
+            by_key[("withdrawal", "AUD-1", 1)]["event_at"],
+            w1["withdrawn_at"])
+        for e in res["events"]:
+            self.assertTrue(e["event_at"].endswith("Z"))
+
+    def test_batch_request_order_and_shared_commit(self):
+        service.publish_releases(
+            [item("ORD-1"), item("ORD-2"), item("ORD-3")])
+        res = service.list_audit_events(0, 100)
+        events = res["events"]
+        self.assertEqual([e["number"] for e in events],
+                         ["ORD-1", "ORD-2", "ORD-3"])
+        # 同批共享 commit_seq，position 按请求顺序
+        self.assertEqual({e["commit_seq"] for e in events}, {1})
+        self.assertEqual([e["position"] for e in events], [0, 1, 2])
+
+    def test_batch_never_split_across_pages(self):
+        # 一个单条提交（commit A，1 事件）+ 一个三条批次（commit B，3 事件）
+        release("SINGLE")
+        service.publish_releases(
+            [item("BULK-1"), item("BULK-2"), item("BULK-3")])
+
+        # limit=3：A 装得下；B 装下后超出本页，且批次大小 3 <= limit，
+        # 停在批次边界（留给下一页，不报错、不拆开）
+        page1 = service.list_audit_events(0, 3)
+        self.assertEqual(self._ops(page1), [("release", "SINGLE", 0)])
+        self.assertTrue(page1["has_more"])
+        self.assertEqual(page1["next_cursor"], 1)
+
+        # 用原游标 + limit=2：B 整批本身大于 limit -> 明确报错，游标不动
+        with self.assertRaises(DomainError) as ctx:
+            service.list_audit_events(1, 2)
+        self.assertEqual(ctx.exception.code, "page_limit_too_small")
+        self.assertEqual(ctx.exception.http_status, 422)
+        self.assertEqual(ctx.exception.details["required_limit"], 3)
+        self.assertEqual(ctx.exception.details["limit"], 2)
+
+        # 调大 limit 后用同一游标重试 -> 整批取出、顺序不拆
+        page2 = service.list_audit_events(1, 3)
+        self.assertEqual([e["number"] for e in page2["events"]],
+                         ["BULK-1", "BULK-2", "BULK-3"])
+        self.assertFalse(page2["has_more"])
+        self.assertEqual(page2["next_cursor"], 4)
+
+        # B 是起始位置的第一个批次且大于 limit 时，同样直接报错（不返回空页）
+        with self.assertRaises(DomainError) as ctx:
+            service.list_audit_events(1, 1)
+        self.assertEqual(ctx.exception.code, "page_limit_too_small")
+
+    def test_greedy_packing_and_walk_to_end(self):
+        for i in range(5):
+            release(f"WALK-{i}")
+        seen: list[int] = []
+        cursor = 0
+        pages = 0
+        while True:
+            res = service.list_audit_events(cursor, 2)
+            pages += 1
+            seen.extend(e["seq"] for e in res["events"])
+            cursor = res["next_cursor"]
+            if not res["has_more"]:
+                break
+        self.assertEqual(pages, 3)  # 2 + 2 + 1
+        self.assertEqual(seen, [1, 2, 3, 4, 5])
+        # 走到尽头：再取是空页、游标保持不变
+        tail = service.list_audit_events(cursor, 10)
+        self.assertEqual(tail["events"], [])
+        self.assertEqual(tail["next_cursor"], cursor)
+        self.assertFalse(tail["has_more"])
+
+    def test_invalid_cursor(self):
+        release("CUR-1")
+        for bad in ("-1", "abc", "1.5", "99999999999999999999999"):
+            with self.assertRaises(DomainError) as ctx:
+                service.list_audit_events(bad)
+            self.assertEqual(ctx.exception.code, "invalid_cursor")
+        # 越过当前最大已提交位置也非法（details 带 last_cursor）
+        with self.assertRaises(DomainError) as ctx:
+            service.list_audit_events("42")
+        self.assertEqual(ctx.exception.code, "invalid_cursor")
+        self.assertEqual(ctx.exception.details["last_cursor"], 1)
+
+    def test_invalid_limit(self):
+        for bad in (0, -1, 1001, "x", "1.5", "", "  "):
+            with self.assertRaises(DomainError) as ctx:
+                service.list_audit_events(0, bad)
+            self.assertEqual(ctx.exception.code, "invalid_page_limit")
+
+    def test_failed_write_does_not_advance_cursor(self):
+        release("ATOM-1")
+        before = service.list_audit_events(0, 100)
+        # 同批两条更正区间重叠 -> 整批回滚，审计事件也不追加、游标不前进
+        with self.assertRaises(DomainError) as ctx:
+            service.submit_corrections([
+                SimpleNamespace(number="ATOM-1", body="A",
+                                valid_start=t2, valid_end=t3,
+                                base_revision=0),
+                SimpleNamespace(number="ATOM-1", body="B 冲突",
+                                valid_start=iso(_T + timedelta(days=35)),
+                                valid_end=iso(_T + timedelta(days=45)),
+                                base_revision=0),
+            ])
+        self.assertEqual(ctx.exception.code,
+                         "concurrent_correction_conflict")
+        after = service.list_audit_events(0, 100)
+        self.assertEqual(self._ops(after), self._ops(before))
+        self.assertEqual(after["next_cursor"], before["next_cursor"])
+
+    def test_failed_withdrawal_batch_leaves_no_audit(self):
+        release("WATOM-1")
+        correct("WATOM-1", 0, t2, t3)
+        before = service.list_audit_events(0, 100)["next_cursor"]
+        # 批量中第二条撤回首版非法 -> 整批回滚
+        with self.assertRaises(DomainError) as ctx:
+            service.withdraw_corrections(
+                [witem("WATOM-1", 1), witem("WATOM-1", 0)])
+        self.assertEqual(ctx.exception.code,
+                         "first_revision_not_withdrawable")
+        self.assertEqual(
+            service.list_audit_events(0, 100)["next_cursor"], before)
+
+    def test_pagination_concurrent_writes_no_gap_or_duplicate(self):
+        import threading
+
+        total = 40
+        stop = threading.Event()
+
+        def writer():
+            for i in range(total):
+                service.publish_releases([item(f"THR-{i}")])
+                if i % 7 == 0:
+                    time.sleep(0.001)
+            stop.set()
+
+        t = threading.Thread(target=writer)
+        t.start()
+        seen: dict[int, dict] = {}
+        cursor = 0
+        while True:
+            res = service.list_audit_events(cursor, 3)
+            for e in res["events"]:
+                # 重复出现即重放
+                self.assertNotIn(e["seq"], seen)
+                seen[e["seq"]] = e
+            cursor = res["next_cursor"]
+            if stop.is_set():
+                # 写线程已全部提交完，但本次读取快照可能取在最后一次提交之前：
+                # 继续用全新快照翻页直到排空（游标不回退，既不会重放也不会遗漏）。
+                while True:
+                    tail = service.list_audit_events(cursor, 3)
+                    for e in tail["events"]:
+                        self.assertNotIn(e["seq"], seen)
+                        seen[e["seq"]] = e
+                    cursor = tail["next_cursor"]
+                    if not tail["events"] and not tail["has_more"]:
+                        break
+                break
+            if not res["events"]:
+                # 空页只是"暂无新提交"，游标保持不变，继续轮询。
+                time.sleep(0.001)
+        t.join()
+        self.assertEqual(sorted(seen), list(range(1, total + 1)))
+
+    def test_upgrade_backfill_reads_legacy_records(self):
+        import sqlite3
+        from app.db import backfill_audit_log
+
+        ts = lambda d: iso_us(_T + timedelta(days=d))
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            cur = conn.execute(
+                "INSERT INTO procedures (number, created_at) VALUES (?, ?)",
+                ("LEG-1", ts(5)))
+            p1 = cur.lastrowid
+            cur = conn.execute(
+                "INSERT INTO versions (procedure_id, revision, body, "
+                "valid_start, valid_end, supersedes_id, published_at) "
+                "VALUES (?, 0, '初版', ?, ?, NULL, ?)",
+                (p1, t1, t5, ts(10)))
+            cur = conn.execute(
+                "INSERT INTO versions (procedure_id, revision, body, "
+                "valid_start, valid_end, supersedes_id, published_at) "
+                "VALUES (?, 1, '更正', ?, ?, ?, ?)",
+                (p1, t2, t3, cur.lastrowid, ts(20)))
+            conn.execute(
+                "INSERT INTO withdrawals (version_id, withdrawn_at) "
+                "VALUES (?, ?)", (cur.lastrowid, ts(30)))
+            conn.commit()
+
+            count = backfill_audit_log(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(count, 3)
+
+        res = service.list_audit_events(0, 1000)
+        self.assertEqual(self._ops(res), [
+            ("release", "LEG-1", 0),
+            ("correction", "LEG-1", 1),
+            ("withdrawal", "LEG-1", 1),
+        ])
+        self.assertEqual([e["event_at"] for e in res["events"]],
+                         [ts(10), ts(20), ts(30)])
+        # 每条旧记录是只含单条事件的独立提交
+        self.assertEqual(len({e["commit_seq"] for e in res["events"]}), 3)
+        self.assertTrue(all(e["position"] == 0 for e in res["events"]))
+        # 起始游标可完整读取；逐页 limit=1 不报错（批次大小都是 1）
+        cursor, walked = 0, []
+        while True:
+            page = service.list_audit_events(cursor, 1)
+            walked.extend(page["events"])
+            cursor = page["next_cursor"]
+            if not page["has_more"]:
+                break
+        self.assertEqual(len(walked), 3)
+
+        # 原记录不被改写：版本/撤回行仍在
+        import sqlite3
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0], 2)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM withdrawals").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+        # 补录幂等：再次调用不重复补录
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            self.assertEqual(backfill_audit_log(conn), 0)
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(len(service.list_audit_events(0, 1000)["events"]), 3)
+
+    def test_backfill_skipped_when_audit_already_has_commits(self):
+        """有了新提交后再补录不动作（真实升级在启动时、任何新写之前完成）。"""
+        import sqlite3
+        from app.db import backfill_audit_log
+
+        release("NEW-1")
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            cur = conn.execute(
+                "INSERT INTO procedures (number, created_at) VALUES (?, ?)",
+                ("OLD-1", iso_us(_T)))
+            conn.execute(
+                "INSERT INTO versions (procedure_id, revision, body, "
+                "valid_start, valid_end, supersedes_id, published_at) "
+                "VALUES (?, 0, 'x', ?, ?, NULL, ?)",
+                (cur.lastrowid, t1, t5, iso_us(_T)))
+            conn.commit()
+            self.assertEqual(backfill_audit_log(conn), 0)
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self._ops(service.list_audit_events(0, 100)),
+                         [("release", "NEW-1", 0)])
+
+
 class ApiTests(unittest.TestCase):
     """FastAPI 层：仅在依赖可用时运行。"""
 
@@ -1785,6 +2104,10 @@ class ApiTests(unittest.TestCase):
         except Exception:
             raise unittest.SkipTest("fastapi/httpx 未安装，跳过 API 测试")
         cls.client = TestClient(app)
+        # 显式进入上下文以触发 startup（init_db 建表/补录）；较旧的
+        # starlette 也兼容（退出时触发 shutdown）。
+        cls.client.__enter__()
+        cls.addClassCleanup(cls.client.__exit__, None, None, None)
 
     def _n(self):
         # 编号全库唯一
@@ -2253,18 +2576,18 @@ class ApiTests(unittest.TestCase):
 
         # 前置编号空白/重复 -> 422；旧式请求（不带 prerequisites）仍可用
         r = c.post("/api/v1/releases", json={
-            "number": self._n(), "body": "x", "valid_start": t1,
+            "number": self._n() + "-BLANK", "body": "x", "valid_start": t1,
             "valid_end": t5, "prerequisites": [" "]})
         self.assertEqual(r.status_code, 422)
         self.assertEqual(r.json()["error"]["code"], "invalid_number")
         r = c.post("/api/v1/releases", json={
-            "number": self._n(), "body": "x", "valid_start": t1,
+            "number": self._n() + "-DUP", "body": "x", "valid_start": t1,
             "valid_end": t5, "prerequisites": ["P", "P"]})
         self.assertEqual(r.status_code, 422)
         self.assertEqual(r.json()["error"]["code"],
                          "duplicate_prerequisite_number")
         r = c.post("/api/v1/releases", json={
-            "number": self._n(), "body": "旧式", "valid_start": t1,
+            "number": self._n() + "-PLAIN", "body": "旧式", "valid_start": t1,
             "valid_end": t5})
         self.assertEqual(r.status_code, 201)
         self.assertEqual(r.json()["items"][0]["prerequisites"], [])
@@ -2520,6 +2843,84 @@ class ApiTests(unittest.TestCase):
                          .json()["count"], 2)
         self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
                          .json()["items"][-1]["revision"], 1)
+
+    def test_audit_events_over_http(self):
+        c = self.client
+        n = self._n()
+        # 空库起始页：空页游标不变
+        r = c.get("/api/v1/audit/events")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body, {"cursor": 0, "next_cursor": 0, "has_more": False,
+                                "count": 0, "limit": 100, "events": []})
+
+        # 发布（单条）+ 更正 + 批量发布 3 条 + 撤回
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+        c.post("/api/v1/corrections", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "三月"})
+        c.post("/api/v1/releases", json={"items": [
+            {"number": f"{n}-B1", "body": "b",
+             "valid_start": t1, "valid_end": t5},
+            {"number": f"{n}-B2", "body": "b",
+             "valid_start": t1, "valid_end": t5},
+            {"number": f"{n}-B3", "body": "b",
+             "valid_start": t1, "valid_end": t5}]})
+        r = c.post("/api/v1/withdrawals",
+                   json={"number": n, "revision": 1})
+        self.assertEqual(r.status_code, 201)
+
+        r = c.get("/api/v1/audit/events", params={"limit": 100})
+        self.assertEqual(r.status_code, 200)
+        events = r.json()["events"]
+        self.assertEqual([(e["op"], e["number"], e["revision"]) for e in events],
+                         [("release", n, 0),
+                          ("correction", n, 1),
+                          ("release", f"{n}-B1", 0),
+                          ("release", f"{n}-B2", 0),
+                          ("release", f"{n}-B3", 0),
+                          ("withdrawal", n, 1)])
+        for key in ("seq", "commit_seq", "position", "event_at"):
+            self.assertIn(key, events[0])
+
+        # 整批不拆开：limit=3 取到前两个单条提交，后随 3 条批次停在边界
+        r = c.get("/api/v1/audit/events", params={"limit": 3})
+        self.assertEqual([e["op"] for e in r.json()["events"]],
+                         ["release", "correction"])
+        self.assertTrue(r.json()["has_more"])
+        cursor_after_two = r.json()["next_cursor"]
+
+        # 用该游标、limit=2：下一批 3 条本身大于 limit -> 422 page_limit_too_small
+        r = c.get("/api/v1/audit/events",
+                  params={"cursor": cursor_after_two, "limit": 2})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "page_limit_too_small")
+        self.assertEqual(r.json()["error"]["details"]["required_limit"], 3)
+
+        # 调大 limit 后同游标重试，整批 3 条顺序返回
+        r = c.get("/api/v1/audit/events",
+                  params={"cursor": cursor_after_two, "limit": 3})
+        self.assertEqual([e["number"] for e in r.json()["events"]],
+                         [f"{n}-B1", f"{n}-B2", f"{n}-B3"])
+
+        # 非法游标 -> 422 invalid_cursor；非法 limit -> 422 invalid_page_limit
+        r = c.get("/api/v1/audit/events", params={"cursor": "nope"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_cursor")
+        r = c.get("/api/v1/audit/events", params={"cursor": 999999})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_cursor")
+        self.assertEqual(r.json()["error"]["details"]["last_cursor"], 6)
+        r = c.get("/api/v1/audit/events", params={"limit": 0})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_page_limit")
+        r = c.get("/api/v1/audit/events", params={"limit": 1001})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_page_limit")
+        r = c.get("/api/v1/audit/events", params={"limit": "two"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_page_limit")
 
 
 if __name__ == "__main__":

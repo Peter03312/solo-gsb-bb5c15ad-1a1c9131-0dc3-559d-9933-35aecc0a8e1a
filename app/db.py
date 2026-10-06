@@ -84,6 +84,29 @@ CREATE TABLE IF NOT EXISTS prerequisites (
     UNIQUE(version_id, position)
 );
 
+-- 值班审计事件日志：只追加，供 GET /api/v1/audit/events 按提交顺序增量取回。
+-- 一次写事务（首次发布 / 批量更正 / 批量撤回）= 一个 audit_commits 行：
+-- 游标只随已提交事务前进，未提交事务的行在任何读连接中均不可见。
+-- 同一提交批次的事件共享 commit_seq、按请求顺序 position 排列，分页保证
+-- 整批取出、绝不跨页拆开。audit_events.seq 为全站全局提交顺序（AUTOINCREMENT
+-- 单调，只增不删），即对外游标依据。事件表不建外键：它是对 versions/
+-- withdrawals 的只追加旁录，且升级前的历史要在不改写原记录的前提下补录。
+CREATE TABLE IF NOT EXISTS audit_commits (
+    commit_seq   INTEGER PRIMARY KEY AUTOINCREMENT,
+    committed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    commit_seq INTEGER NOT NULL,
+    position   INTEGER NOT NULL,
+    op         TEXT NOT NULL,
+    number     TEXT NOT NULL,
+    revision   INTEGER NOT NULL,
+    event_at   TEXT NOT NULL,
+    UNIQUE(commit_seq, position)
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_procedure
     ON versions(procedure_id);
 CREATE INDEX IF NOT EXISTS idx_versions_query
@@ -94,6 +117,8 @@ CREATE INDEX IF NOT EXISTS idx_package_items_package
     ON package_items(package_id);
 CREATE INDEX IF NOT EXISTS idx_prerequisites_version
     ON prerequisites(version_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_commit
+    ON audit_events(commit_seq, seq);
 """
 
 _write_lock = threading.Lock()
@@ -109,7 +134,12 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """幂等建表；内存库可安全重复调用。"""
+    """幂等建表并补录升级前历史；内存库可安全重复调用。
+
+    建表与历史补录在同一条事务内完成：旧库升级时把升级前已存在的
+    versions/withdrawals 行按提交顺序回填进审计日志（每条记录一个提交、
+    呈现为单条事件），全程只读旧表、不改写任何原记录。
+    """
     if settings.db_path != ":memory:":
         parent = os.path.dirname(os.path.abspath(settings.db_path))
         os.makedirs(parent, exist_ok=True)
@@ -118,9 +148,56 @@ def init_db() -> None:
         if settings.db_path != ":memory:":
             conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(_SCHEMA)
+        backfill_audit_log(conn)
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
+
+# 升级前已落库的版本/撤回行按"服务端时刻"（published_at / withdrawn_at）
+# 排序补录；同一时刻的并列按 op 与编号/版本号给出确定次序。首版
+# (revision=0) 是首次发布，其余版本行是更正；撤回行一律为 withdrawal。
+# 每条旧记录形成一个独立的审计提交（commit 与 event 一一对应、各只有一条
+# 事件），因此补录部分同样满足"一页至少装得下一个完整批次"。
+_BACKFILL_SQL = """
+SELECT v.published_at AS event_at,
+       CASE WHEN v.revision = 0 THEN 'release' ELSE 'correction' END AS op,
+       p.number AS number, v.revision AS revision
+  FROM versions v
+  JOIN procedures p ON p.id = v.procedure_id
+UNION ALL
+SELECT w.withdrawn_at AS event_at, 'withdrawal' AS op,
+       p.number AS number, v.revision AS revision
+  FROM withdrawals w
+  JOIN versions v ON v.id = w.version_id
+  JOIN procedures p ON p.id = v.procedure_id
+ORDER BY event_at, op, number, revision
+"""
+
+
+def backfill_audit_log(conn: sqlite3.Connection) -> int:
+    """把升级前的 versions/withdrawals 行补录进审计日志（幂等）。
+
+    仅在审计事件表为空、而业务表已有记录时执行；补录只读旧表、绝不
+    UPDATE/DELETE 原记录。返回补录的事件数。调用方负责提交/回滚。
+    """
+    existing = conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+    if existing:
+        return 0
+    rows = conn.execute(_BACKFILL_SQL).fetchall()
+    for event_at, op, number, revision in rows:
+        cur = conn.execute(
+            "INSERT INTO audit_commits (committed_at) VALUES (?)",
+            (event_at,))
+        commit_seq = cur.lastrowid
+        conn.execute(
+            "INSERT INTO audit_events (commit_seq, position, op, number, "
+            "revision, event_at) VALUES (?, 0, ?, ?, ?, ?)",
+            (commit_seq, op, number, revision, event_at))
+    return len(rows)
 
 
 @contextmanager

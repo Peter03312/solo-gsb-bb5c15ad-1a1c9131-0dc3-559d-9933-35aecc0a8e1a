@@ -238,3 +238,32 @@ def prerequisite_cycle(cycle: list[str]) -> DomainError:
         "prerequisite_cycle",
         f"前置规程引用存在环：{' -> '.join(cycle)}，不返回部分清单",
         http_status=409, details={"cycle": cycle})
+
+
+# ---------------------------------------------------------------- 值班审计
+
+
+def invalid_cursor(value: str, reason: str,
+                   last_cursor: int | None = None) -> DomainError:
+    details = {"cursor": value, "reason": reason}
+    if last_cursor is not None:
+        details["last_cursor"] = last_cursor
+    return DomainError(
+        "invalid_cursor", f"接收游标非法：{reason}",
+        http_status=422, details=details)
+
+
+def invalid_page_limit(value, reason: str) -> DomainError:
+    return DomainError(
+        "invalid_page_limit", f"每页事件上限非法：{reason}",
+        http_status=422, details={"limit": value, "reason": reason})
+
+
+def page_limit_too_small(limit: int, commit_seq: int, required: int) -> DomainError:
+    reason = (f"每页事件上限 {limit} 装不下下一个完整提交批次"
+              f"（commit_seq={commit_seq} 含 {required} 条事件，"
+              f"批次不可跨页拆开）；请调大 limit 后用同一游标重试")
+    return DomainError(
+        "page_limit_too_small", reason, http_status=422,
+        details={"limit": limit, "commit_seq": commit_seq,
+                 "required_limit": required, "reason": reason})

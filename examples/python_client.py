@@ -131,6 +131,87 @@ def main() -> None:
     # 14) 更正批量预演（本轮新增）：只读，不落库、不占版本号
     _correction_preview_examples()
 
+    # 15) 值班审计事件流：游标增量取回，整批不拆开、不重不漏
+    _audit_examples()
+
+
+def _audit_examples() -> None:
+    """值班审计事件流示例：接收游标 + 每页上限，按提交顺序增量拉取。"""
+    import urllib.parse
+
+    # 先产生一个三条同批的发布，演示"同一批次不跨页拆开"
+    call("POST", "/api/v1/releases", {"items": [
+        {"number": "SOP-AUDIT-001", "body": "审计批次条目 1",
+         "valid_start": "2026-01-01T00:00:00Z",
+         "valid_end": "2027-01-01T00:00:00Z"},
+        {"number": "SOP-AUDIT-002", "body": "审计批次条目 2",
+         "valid_start": "2026-01-01T00:00:00Z",
+         "valid_end": "2027-01-01T00:00:00Z"},
+        {"number": "SOP-AUDIT-003", "body": "审计批次条目 3",
+         "valid_start": "2026-01-01T00:00:00Z",
+         "valid_end": "2027-01-01T00:00:00Z"},
+    ]})
+
+    # 15.1 起始读取：cursor 省略或为 0；升级前历史也从这里按单条事件完整返回
+    status, res = call("GET", "/api/v1/audit/events?limit=100")
+    show("15.1 审计事件首页（从起始游标，最多 100 条）", status,
+         {"cursor": res["cursor"], "next_cursor": res["next_cursor"],
+          "has_more": res["has_more"], "count": res["count"],
+          "events_head": res["events"][:6]})
+
+    # 15.2 标准增量轮询：保存 next_cursor，has_more=true 就立刻翻页；
+    #      has_more=false 时空页 next_cursor 保持不变，稍后用同一游标重试。
+    def drain(cursor: int, limit: int, max_pages: int = 50):
+        pages, seen = [], []
+        for _ in range(max_pages):
+            q = urllib.parse.urlencode({"cursor": cursor, "limit": limit})
+            status, page = call("GET", f"/api/v1/audit/events?{q}")
+            if status != 200:
+                return status, page
+            pages.append(page)
+            seen.extend(e["seq"] for e in page["events"])
+            cursor = page["next_cursor"]
+            if not page["has_more"]:
+                break
+        return 200, {"pages": len(pages), "seqs": seen,
+                     "last_cursor": cursor}
+
+    status, res = drain(0, 5)
+    show("15.2 从起始连续翻页（每页 5 条），seq 严格递增不重不漏", status, res)
+
+    # 15.3 上限装不下下一完整批次 -> 422 page_limit_too_small：
+    #      先定位本函数开头那条三条批次的前一游标，再用 limit=1 请求它。
+    _, full = call("GET", "/api/v1/audit/events?limit=1000")
+    audit_seqs = [e["seq"] for e in full["events"]
+                  if e["number"] == "SOP-AUDIT-001"]
+    if audit_seqs:
+        batch_start = audit_seqs[0]
+        before_cursor = batch_start - 1     # 批次前一条事件的 seq（可能为 0）
+        q = urllib.parse.urlencode({"cursor": before_cursor, "limit": 1})
+        status, res = call("GET", f"/api/v1/audit/events?{q}")
+        show("15.3 limit=1 装不下三条批次 -> 422 page_limit_too_small",
+             status, res)
+        if status == 422 and res["error"]["code"] == "page_limit_too_small":
+            need = res["error"]["details"]["required_limit"]
+            q = urllib.parse.urlencode({"cursor": before_cursor, "limit": need})
+            status, res = call("GET", f"/api/v1/audit/events?{q}")
+            show(f"15.3b 按 required_limit={need} 用同一游标重试，整批取出",
+                 status, {"next_cursor": res["next_cursor"],
+                          "events": [(e["op"], e["number"], e["revision"],
+                                      e["position"]) for e in res["events"]]})
+
+    # 15.4 非法游标 / 非法上限
+    for label, path in [
+        ("游标非数字", "/api/v1/audit/events?cursor=abc"),
+        ("游标为负", "/api/v1/audit/events?cursor=-1"),
+        ("游标越过末端", "/api/v1/audit/events?cursor=999999999"),
+        ("limit=0", "/api/v1/audit/events?limit=0"),
+        ("limit 超 1000", "/api/v1/audit/events?limit=1001"),
+    ]:
+        status, res = call("GET", path)
+        show(f"15.4 {label} -> {res['error']['code']}", status,
+             res["error"]["details"])
+
 
 def _correction_preview_examples() -> None:
     """更正批量预演：提交前预演整批结果，只读、不写版本、不占版本号。"""

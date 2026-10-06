@@ -592,3 +592,52 @@ curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
            "valid_end":   "2026-12-01T00:00:00Z", "body": "x"}
         ]
       }'; echo
+
+# ========================================================================
+# 值班审计事件流：GET /api/v1/audit/events
+# 按提交顺序游标分页；同批不拆开、不重不漏；事件含 op/number/revision/event_at
+# ========================================================================
+
+# --- 38a. 为演示再产生一个三条同批的发布批次（与前面的单条提交形成对比） ----
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{ "items": [
+        {"number": "SOP-AUDIT-001", "body": "审计批次条目 1",
+         "valid_start": "2026-01-01T00:00:00Z", "valid_end": "2027-01-01T00:00:00Z"},
+        {"number": "SOP-AUDIT-002", "body": "审计批次条目 2",
+         "valid_start": "2026-01-01T00:00:00Z", "valid_end": "2027-01-01T00:00:00Z"},
+        {"number": "SOP-AUDIT-003", "body": "审计批次条目 3",
+         "valid_start": "2026-01-01T00:00:00Z", "valid_end": "2027-01-01T00:00:00Z"}
+      ]}'; echo
+
+# --- 38b. 从起始游标读取首页（省略 cursor 等价 cursor=0） -----------------
+# 升级前已有的版本/撤回也会从这里开始按单条事件完整呈现。
+curl -sS "$BASE_URL/api/v1/audit/events?limit=100" | python3 -m json.tool 2>/dev/null \
+  || curl -sS "$BASE_URL/api/v1/audit/events?limit=100"; echo
+
+# --- 38c. 接收游标翻页：把上一页 next_cursor 原样回传 --------------------
+#   has_more=true  -> 立即用 next_cursor 继续；
+#   has_more=false -> 等待新提交后用同一游标重试（空页游标保持不变）。
+curl -sS "$BASE_URL/api/v1/audit/events?cursor=0&limit=5"; echo
+
+# --- 38d. 每页上限装不下下一完整批次 -> 422 page_limit_too_small ----------
+# details.required_limit 给出下一批次的事件数；调大 limit 后用同一游标重试，
+# 同一批次绝不会被拆到两页。
+curl -sS -i "$BASE_URL/api/v1/audit/events?cursor=1&limit=1"; echo
+
+# --- 38e. 非法游标（非数字 / 负数 / 越过末端） -> 422 invalid_cursor -----
+curl -sS -i "$BASE_URL/api/v1/audit/events?cursor=not-a-number"; echo
+curl -sS -i "$BASE_URL/api/v1/audit/events?cursor=-1"; echo
+curl -sS -i "$BASE_URL/api/v1/audit/events?cursor=999999999"; echo
+
+# --- 38f. 非法每页上限（0 / 超过 1000） -> 422 invalid_page_limit --------
+curl -sS -i "$BASE_URL/api/v1/audit/events?limit=0"; echo
+curl -sS -i "$BASE_URL/api/v1/audit/events?limit=1001"; echo
+
+# --- 38g. 轮询循环（shell 版）：一直跟到 has_more=false ------------------
+# cursor=0; while :; do
+#   resp=$(curl -sS "$BASE_URL/api/v1/audit/events?cursor=$cursor&limit=100")
+#   echo "$resp"
+#   cursor=$(echo "$resp" | sed -n 's/.*"next_cursor": *\([0-9]*\).*/\1/p')
+#   echo "$resp" | grep -q '"has_more": true' || break
+# done

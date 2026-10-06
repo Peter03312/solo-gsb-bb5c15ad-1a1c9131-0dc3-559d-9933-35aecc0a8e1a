@@ -81,6 +81,25 @@
 - 预演**全程只读**：不写版本、不占版本号、不推进服务端时钟、不改变历史
   （连正式提交与预演共用的应用逻辑也跑在副本上）；正式提交仍须按提交时
   的当时状态重新校验，预演结果不保证可提交。
+
+值班审计事件流
+--------------
+三类写操作（首次发布、批量更正、批量撤回）在各自写事务内**同事务**向
+审计日志追加事件（``audit_commits`` / ``audit_events``）：
+
+- 一次写事务 = 一个审计提交，事件按请求顺序写 position；事务回滚（整批
+  拒绝）时审计行一并消失，因此游标只随**已提交事务**前进；
+- ``audit_events.seq`` 是 AUTOINCREMENT 的全站全局顺序，只增不删，作为
+  对外游标依据；
+- 分页（list_audit_events）以**完整提交批次**为最小单位贪心装入一页：
+  同批按请求顺序排列、绝不跨页拆开；单页在同一只读快照事务内读取，翻页
+  期间并发的新提交要么整批可见要么尚不可见，不会重现或遗漏；
+- 空页 ``next_cursor`` 保持为接收游标；游标非法（非非负整数、越过最大已
+  提交位置）报 invalid_cursor；下一完整批次大于 limit 报
+  page_limit_too_small（不动游标，调大 limit 后用同一游标重试）；
+- 升级前已存在的 versions/withdrawals 行由 init_db 在不改写原记录的前提
+  下按服务端时刻顺序补录，每条旧记录形成一个只含单条事件的提交，故从起始
+  游标即可完整读取升级前历史。
 """
 from __future__ import annotations
 
@@ -283,6 +302,26 @@ def _insert_prerequisites(conn: sqlite3.Connection, version_id: int,
             "VALUES (?, ?, ?)", (version_id, pos, number))
 
 
+def _record_audit_commit(conn: sqlite3.Connection, committed_at: str,
+                         events: list[dict]) -> int:
+    """在当前写事务内追加一个审计提交及其事件（与业务行同一事务提交）。
+
+    仅当外层事务成功 COMMIT 后这些审计行才对任何读连接可见，因此审计游标
+    只随**已提交事务**前进；整批校验失败回滚时审计行同步消失，不占序号。
+    事件按 ``events`` 给定顺序（即请求顺序）写 position。返回 commit_seq。
+    """
+    cur = conn.execute(
+        "INSERT INTO audit_commits (committed_at) VALUES (?)", (committed_at,))
+    commit_seq = cur.lastrowid
+    for position, event in enumerate(events):
+        conn.execute(
+            "INSERT INTO audit_events (commit_seq, position, op, number, "
+            "revision, event_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (commit_seq, position, event["op"], event["number"],
+             event["revision"], event["event_at"]))
+    return commit_seq
+
+
 def _prerequisites_of(conn: sqlite3.Connection, version_id: int) -> list[str]:
     """某版本携带的前置规程编号列表（按写入顺序）；无记录即空列表。"""
     rows = conn.execute(
@@ -364,6 +403,10 @@ def publish_releases(items: list) -> dict:
                             "valid_start": start, "valid_end": end,
                             "published_at": published_at,
                             "prerequisites": prerequisites})
+        _record_audit_commit(conn, published_at, [
+            {"op": "release", "number": entry["number"],
+             "revision": entry["revision"], "event_at": published_at}
+            for entry in created])
     return {"published_at": published_at, "items": created}
 
 # ---------------------------------------------------------------- 更正提交
@@ -378,6 +421,10 @@ def submit_corrections(items: list) -> dict:
     with write_tx() as conn:
         published_at = _server_now()
         applied = _apply_corrections(conn, items, published_at)
+        _record_audit_commit(conn, published_at, [
+            {"op": "correction", "number": entry["number"],
+             "revision": entry["revision"], "event_at": published_at}
+            for entry in applied])
     # 正式提交的响应形状保持不变：每项回填服务端发布时刻、不带预演用的 index。
     created = [{k: v for k, v in entry.items() if k != "index"}
                | {"published_at": published_at}
@@ -552,7 +599,8 @@ def _in_memory_clone(conn: sqlite3.Connection) -> sqlite3.Connection:
         clone.execute("PRAGMA foreign_keys = OFF")
         clone.executescript(_SCHEMA)
         tables = ["procedures", "versions", "withdrawals", "packages",
-                  "package_items", "prerequisites"]
+                  "package_items", "prerequisites",
+                  "audit_commits", "audit_events"]
         for table in tables:
             rows = conn.execute(f"SELECT * FROM {table}").fetchall()
             if not rows:
@@ -703,6 +751,11 @@ def withdraw_corrections(items: list) -> dict:
                 "published_at": version["published_at"],
                 "withdrawn_at": withdrawn_at,
             })
+
+        _record_audit_commit(conn, withdrawn_at, [
+            {"op": "withdrawal", "number": entry["number"],
+             "revision": entry["revision"], "event_at": withdrawn_at}
+            for entry in created])
 
     return {"withdrawn_at": withdrawn_at, "items": created}
 
@@ -1506,3 +1559,108 @@ def review_package(package_id_raw: str, review_known_raw: str) -> dict:
             "count": len(items),
             "all_match": all_match,
             "items": items}
+
+# ---------------------------------------------------------------- 值班审计事件流
+
+
+DEFAULT_AUDIT_LIMIT = 100
+MAX_AUDIT_LIMIT = 1000
+
+
+def _parse_audit_cursor(raw) -> int:
+    """接收游标：0（或省略/空串）表示起始；否则须为非负十进制整数。"""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return 0
+    text = str(raw).strip()
+    if not text.isdigit():
+        raise errors.invalid_cursor(
+            text, "游标须为非负整数（上一页返回的 next_cursor），"
+                  "起始位置省略该参数或传 0")
+    cursor = int(text)
+    if cursor > 9223372036854775807:
+        raise errors.invalid_cursor(text, "游标超出范围")
+    return cursor
+
+
+def _parse_audit_limit(raw) -> int:
+    if raw is None:
+        return DEFAULT_AUDIT_LIMIT
+    text = str(raw).strip()
+    if not text.isdigit():
+        # 拒绝小数、负数、含空白/下划线或非数字的一切形状
+        raise errors.invalid_page_limit(
+            raw, f"limit 须为 1..{MAX_AUDIT_LIMIT} 的整数")
+    limit = int(text)
+    if limit < 1 or limit > MAX_AUDIT_LIMIT:
+        raise errors.invalid_page_limit(
+            raw, f"limit 须在 1..{MAX_AUDIT_LIMIT} 之间")
+    return limit
+
+
+def list_audit_events(cursor_raw=None, limit_raw=None) -> dict:
+    """值班审计：按提交顺序增量取回规程变动事件。
+
+    - 游标为上一页返回的 ``next_cursor``（事件 ``seq``）；省略/0 表示起始，
+      从升级前补录的第一条历史开始完整读取。
+    - 每页以**完整提交批次**为最小单位贪心装入：同一批次按请求顺序排列、
+      绝不跨页拆开；因此返回的事件数可能少于 limit，也可能为空页。
+    - 全程在单只读快照事务内完成：翻页期间并发的新提交要么整批可见、要么
+      尚不可见，不会造成事件重现或遗漏；游标只随已提交事务前进。
+    - 空页（游标之后暂无已提交事件）时 ``next_cursor`` 与接收游标相同、
+      ``has_more=false``，游标保持不变。
+    - 下一个完整批次本身装不下 limit -> 422 page_limit_too_small（不动游标）；
+      游标非法 -> 422 invalid_cursor。
+    """
+    cursor = _parse_audit_cursor(cursor_raw)
+    limit = _parse_audit_limit(limit_raw)
+
+    with read_snapshot() as conn:
+        max_seq = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM audit_events").fetchone()[0]
+        if cursor > max_seq:
+            # 游标必须指向一条已提交事件：不允许跳过/猜测未来位置。
+            raise errors.invalid_cursor(
+                str(cursor),
+                "游标超出当前已提交事件的最大位置（非法游标或来自其他数据库）",
+                last_cursor=max_seq)
+
+        # 游标之后的提交批次，按全局提交顺序（commit_seq 即事务提交次序）。
+        commits = [r["commit_seq"] for r in conn.execute(
+            "SELECT DISTINCT commit_seq FROM audit_events "
+            "WHERE seq > ? ORDER BY commit_seq", (cursor,)).fetchall()]
+
+        events: list[dict] = []
+        has_more = False
+        for commit_seq in commits:
+            batch = conn.execute(
+                "SELECT * FROM audit_events WHERE commit_seq = ? "
+                "ORDER BY position, seq", (commit_seq,)).fetchall()
+            if len(events) + len(batch) > limit:
+                # 本页剩余容量装不下"下一个完整批次"，停在批次边界：
+                # - 该批次本身就大于 limit -> 无论如何翻页都装不下，明确报错
+                #   （游标不动，调大 limit 后用同一游标重试）；
+                # - 否则整批留给下一页，绝不跨页拆开。
+                if len(batch) > limit:
+                    raise errors.page_limit_too_small(
+                        limit, commit_seq, len(batch))
+                has_more = True
+                break
+            for row in batch:
+                events.append({
+                    "seq": row["seq"],
+                    "op": row["op"],
+                    "number": row["number"],
+                    "revision": row["revision"],
+                    "event_at": row["event_at"],
+                    "commit_seq": row["commit_seq"],
+                    "position": row["position"],
+                })
+        else:
+            # 游标后的批次都已完整装入本页，没有后续。
+            has_more = False
+
+        next_cursor = events[-1]["seq"] if events else cursor
+
+    return {"cursor": cursor, "next_cursor": next_cursor,
+            "has_more": has_more, "count": len(events),
+            "limit": limit, "events": events}
