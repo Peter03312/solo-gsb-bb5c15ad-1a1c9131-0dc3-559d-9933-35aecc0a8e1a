@@ -72,6 +72,7 @@ def index() -> dict:
                 "GET  /api/v1/procedures/{number}/diff",
                 "GET  /api/v1/procedures/{number}/closure",
                 "GET  /api/v1/procedures/{number}/closure-plan",
+                "GET  /api/v1/audit/events",
             ]}
 
 
@@ -228,3 +229,20 @@ def review_package(package_id: str, known_as_of: str) -> dict:
     缺时区）-> 422。
     """
     return service.review_package(package_id, known_as_of)
+
+
+@app.get("/api/v1/audit/events")
+def audit_events(cursor: str | None = None,
+                 limit: str | None = None) -> dict:
+    """值班审计变动日志：按提交顺序增量取回全站规程变动。
+
+    查询参数：``cursor`` 为上一页响应的 ``next_cursor``（省略/空/0 表示
+    起始游标，从升级前历史的第一条事件开始）；``limit`` 为每页事件数上限
+    （默认 100、最大 1000）。返回事件列表、``next_cursor`` 与 ``has_more``。
+    事件含操作类型（release/correction/withdrawal）、规程编号、版本号与
+    服务端时刻；同一新提交批次按请求顺序排列且分页不可拆开，游标只随已提交
+    事务前进。非法游标 -> 422 invalid_cursor；上限装不下下一完整批次 ->
+    422 page_limit_too_small（游标不前进）；上限非 1..1000 整数 ->
+    422 invalid_page_limit。
+    """
+    return service.read_change_feed(cursor, limit)

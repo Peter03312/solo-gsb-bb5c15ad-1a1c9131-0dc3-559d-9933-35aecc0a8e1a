@@ -238,3 +238,32 @@ def prerequisite_cycle(cycle: list[str]) -> DomainError:
         "prerequisite_cycle",
         f"前置规程引用存在环：{' -> '.join(cycle)}，不返回部分清单",
         http_status=409, details={"cycle": cycle})
+
+
+# ---------------------------------------------------------------- 值班审计变动日志
+
+
+def invalid_cursor(value: str) -> DomainError:
+    return DomainError(
+        "invalid_cursor",
+        f"非法游标 {value!r}：游标必须是此前响应返回的 next_cursor"
+        f"（不透明正整数字符串），首次读取请省略 cursor 或传 0",
+        http_status=422, details={"cursor": value})
+
+
+def invalid_page_limit(value: str) -> DomainError:
+    return DomainError(
+        "invalid_page_limit",
+        f"每页事件上限非法：{value!r} 必须是 1..1000 的整数",
+        http_status=422, details={"limit": value, "max": 1000})
+
+
+def page_limit_too_small(limit: int, batch_seq: int, batch_size: int) -> DomainError:
+    return DomainError(
+        "page_limit_too_small",
+        f"每页事件上限 {limit} 装不下下一完整批次（批次 seq={batch_seq}，"
+        f"含 {batch_size} 个事件）：同一提交批次不可跨页拆开，请调大 limit 后"
+        f"以同一游标重试；游标未前进、无事件返回",
+        http_status=422,
+        details={"limit": limit, "batch_seq": batch_seq,
+                 "batch_size": batch_size})

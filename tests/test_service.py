@@ -37,9 +37,12 @@ def reset_db() -> None:
     try:
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.executescript(
+            "DELETE FROM audit_events; DELETE FROM audit_batches; "
             "DELETE FROM prerequisites; "
             "DELETE FROM package_items; DELETE FROM packages; "
-            "DELETE FROM versions; DELETE FROM procedures;")
+            "DELETE FROM withdrawals; "
+            "DELETE FROM versions; DELETE FROM procedures; "
+            "DELETE FROM sqlite_sequence;")
         conn.commit()
     finally:
         conn.close()
@@ -2520,6 +2523,394 @@ class ApiTests(unittest.TestCase):
                          .json()["count"], 2)
         self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
                          .json()["items"][-1]["revision"], 1)
+
+    def test_audit_feed_over_http(self):
+        c = self.client
+        n = self._n()
+        # 空库：起始游标空页
+        r = c.get("/api/v1/audit/events")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["events"], [])
+        self.assertEqual(r.json()["next_cursor"], "0")
+        self.assertFalse(r.json()["has_more"])
+
+        # 首次发布（单事件批次）
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+        # 批量更正 2 条（同一请求顺序，一个 2 事件批次）
+        r = c.post("/api/v1/corrections", json={"items": [
+            {"number": n, "base_revision": 0,
+             "valid_start": t2, "valid_end": t3, "body": "三月"},
+            {"number": n, "base_revision": 1,
+             "valid_start": iso(_T + timedelta(days=33)),
+             "valid_end": iso(_T + timedelta(days=40)), "body": "三月中"}]})
+        self.assertEqual(r.status_code, 201)
+        # 撤回 r2（单事件批次）
+        c.post("/api/v1/withdrawals", json={"number": n, "revision": 2})
+
+        r = c.get("/api/v1/audit/events", params={"limit": 10})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(
+            [(e["operation"], e["number"], e["revision"])
+             for e in body["events"]],
+            [("release", n, 0), ("correction", n, 1),
+             ("correction", n, 2), ("withdrawal", n, 2)])
+        # 服务端时刻齐备且为 UTC 微秒串
+        for e in body["events"]:
+            self.assertRegex(e["event_time"],
+                             r"^\d{4}-\d{2}-\d{2}T.*\.\d{6}Z$")
+        # 同批两条更正 batch_seq 相同、position 为 0/1
+        self.assertEqual(body["events"][1]["batch_seq"],
+                         body["events"][2]["batch_seq"])
+        self.assertEqual([body["events"][1]["position"],
+                          body["events"][2]["position"]], [0, 1])
+        self.assertFalse(body["has_more"])
+
+        # 翻页：limit=1 装不下 2 事件批次 -> 422 page_limit_too_small，
+        # 游标仍可原样重试（不前进）
+        first_cursor = body["events"][0]["batch_seq"]
+        r = c.get("/api/v1/audit/events",
+                  params={"cursor": str(first_cursor), "limit": 1})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "page_limit_too_small")
+        self.assertEqual(r.json()["error"]["details"]["batch_size"], 2)
+        # 调大 limit 后同一游标可取回后续（2 事件批次 + 撤回共 3 事件）
+        r = c.get("/api/v1/audit/events",
+                  params={"cursor": str(first_cursor), "limit": 3})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            [(e["operation"], e["revision"]) for e in r.json()["events"]],
+            [("correction", 1), ("correction", 2), ("withdrawal", 2)])
+        self.assertFalse(r.json()["has_more"])
+
+        # 空页保持游标不变
+        tail_cursor = r.json()["next_cursor"]
+        r = c.get("/api/v1/audit/events", params={"cursor": tail_cursor})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["events"], [])
+        self.assertEqual(r.json()["next_cursor"], tail_cursor)
+
+        # 端点已列入根索引
+        self.assertIn("GET  /api/v1/audit/events",
+                      c.get("/").json()["endpoints"])
+
+    def test_audit_feed_bad_params_over_http(self):
+        c = self.client
+        for bad in ("abc", "-1", "999999"):
+            r = c.get("/api/v1/audit/events", params={"cursor": bad})
+            self.assertEqual(r.status_code, 422, bad)
+            self.assertEqual(r.json()["error"]["code"], "invalid_cursor")
+        for bad in ("0", "-5", "1001", "x"):
+            r = c.get("/api/v1/audit/events", params={"limit": bad})
+            self.assertEqual(r.status_code, 422, bad)
+            self.assertEqual(r.json()["error"]["code"], "invalid_page_limit")
+
+
+class AuditFeedTests(unittest.TestCase):
+    """值班审计变动日志：按提交顺序增量取回，批次原子分页。"""
+
+    def setUp(self):
+        reset_db()
+
+    def test_empty_feed_from_origin(self):
+        page = service.read_change_feed(None, None)
+        self.assertEqual(page["count"], 0)
+        self.assertEqual(page["events"], [])
+        self.assertEqual(page["cursor"], "0")
+        self.assertEqual(page["next_cursor"], "0")
+        self.assertFalse(page["has_more"])
+        # 默认上限
+        self.assertEqual(page["limit"], 100)
+        # 空页用游标 0 重试，仍是空页、游标不变
+        again = service.read_change_feed("0", None)
+        self.assertEqual(again["next_cursor"], "0")
+        self.assertEqual(again["events"], [])
+
+    def test_events_cover_release_correction_withdrawal_order(self):
+        r1 = release("AUD-A")["published_at"]
+        r2 = service.publish_releases([item("AUD-B"), item("AUD-C")])["published_at"]
+        c1 = correct("AUD-A", 0, t2, t3, "更正A1")["published_at"]
+        wd = withdraw("AUD-A", 1)["withdrawn_at"]
+        page = service.read_change_feed(None, 100)
+        ops = [(e["operation"], e["number"], e["revision"])
+               for e in page["events"]]
+        self.assertEqual(ops, [
+            ("release", "AUD-A", 0),
+            ("release", "AUD-B", 0),
+            ("release", "AUD-C", 0),
+            ("correction", "AUD-A", 1),
+            ("withdrawal", "AUD-A", 1),
+        ])
+        times = {"release": {"AUD-A": r1, "AUD-B": r2, "AUD-C": r2},
+                 "correction": {"AUD-A": c1},
+                 "withdrawal": {"AUD-A": wd}}
+        for e in page["events"]:
+            self.assertEqual(e["event_time"],
+                             times[e["operation"]][e["number"]])
+            self.assertRegex(e["event_time"], r"^\d{4}-\d{2}-\d{2}T.*Z$")
+        self.assertFalse(page["has_more"])
+        # 末页 next_cursor 固定，再读为空页且游标不变
+        tail = service.read_change_feed(page["next_cursor"])
+        self.assertEqual(tail["events"], [])
+        self.assertEqual(tail["next_cursor"], page["next_cursor"])
+        self.assertFalse(tail["has_more"])
+
+    def test_batch_kept_together_atomic_and_ordered(self):
+        # 一次批量首次发布 3 条 -> 一个 3 事件批次，顺序=请求顺序
+        service.publish_releases([item("BD-1"), item("BD-2"), item("BD-3")])
+        # limit=2 装不下 3 事件的批次 -> 明确报错，游标不前进、无事件
+        with self.assertRaises(DomainError) as ctx:
+            service.read_change_feed(None, 2)
+        self.assertEqual(ctx.exception.code, "page_limit_too_small")
+        self.assertEqual(ctx.exception.http_status, 422)
+        self.assertEqual(ctx.exception.details["batch_size"], 3)
+        self.assertEqual(ctx.exception.details["limit"], 2)
+        # limit=3 整批返回，且批次内 position 为 0/1/2
+        page = service.read_change_feed(None, 3)
+        self.assertEqual([e["number"] for e in page["events"]],
+                         ["BD-1", "BD-2", "BD-3"])
+        self.assertEqual([e["position"] for e in page["events"]], [0, 1, 2])
+        self.assertEqual(len({e["batch_seq"] for e in page["events"]}), 1)
+        self.assertFalse(page["has_more"])
+
+    def test_multi_batch_pagination_no_dup_no_gap(self):
+        # 三个事务：单事件批次 + 2 事件批次 + 单事件批次
+        release("PG-1")
+        service.publish_releases([item("PG-2"), item("PG-3")])
+        release("PG-4")
+        seen: list[tuple] = []
+        cursor = None
+        pages = 0
+        while True:
+            page = service.read_change_feed(cursor, 2)
+            pages += 1
+            for e in page["events"]:
+                key = (e["batch_seq"], e["position"])
+                self.assertNotIn(key, seen)          # 不重现
+                seen.append(key)
+            cursor = page["next_cursor"]
+            if not page["has_more"]:
+                break
+        self.assertEqual([(e["number"], e["revision"])
+                          for e in self._all_events()],
+                         [("PG-1", 0), ("PG-2", 0), ("PG-3", 0), ("PG-4", 0)])
+        self.assertEqual(len(seen), 4)               # 不遗漏
+        # 第 2 页恰好取 2 事件批次（不会把后面单事件也带上：limit=2）
+        self.assertGreaterEqual(pages, 3)
+
+    @staticmethod
+    def _all_events() -> list:
+        return service.read_change_feed(None, 1000)["events"]
+
+    def test_rollback_leaves_no_audit_batch(self):
+        # 批量撤回第二条非法（首版）-> 整批回滚，审计批次也不存在
+        release("RB-1")
+        correct("RB-1", 0, t2, t3, "更正")
+        with self.assertRaises(DomainError):
+            service.withdraw_corrections(
+                [witem("RB-1", 1), witem("RB-1", 0)])
+        events = self._all_events()
+        self.assertEqual([e["operation"] for e in events],
+                         ["release", "correction"])
+
+    def test_invalid_cursor(self):
+        release("IC-1")
+        for bad in ("abc", "-1", "1.5", "xyz9"):
+            with self.assertRaises(DomainError) as ctx:
+                service.read_change_feed(bad, 10)
+            self.assertEqual(ctx.exception.code, "invalid_cursor")
+        # 语法合法但不指向任何批次（未提交事务不产生批次，游标不前进）
+        with self.assertRaises(DomainError) as ctx:
+            service.read_change_feed("999999", 10)
+        self.assertEqual(ctx.exception.code, "invalid_cursor")
+
+    def test_invalid_limit(self):
+        for bad in ("0", "-1", "1001", "abc", "1.0"):
+            with self.assertRaises(DomainError) as ctx:
+                service.read_change_feed(None, bad)
+            self.assertEqual(ctx.exception.code, "invalid_page_limit")
+            self.assertEqual(ctx.exception.details["max"], 1000)
+
+    def test_concurrent_commits_during_paging_no_dup_no_gap(self):
+        # 翻页期间并发写入：新提交要么整批可见、要么整批不可见，
+        # 全量走完全部页后不重现、不遗漏。
+        release("CC-0")
+        import threading
+
+        stop = threading.Event()
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                name = f"CC-W-{i:03d}"
+                try:
+                    service.publish_releases([item(name)])
+                except DomainError:
+                    pass
+                i += 1
+
+        t = threading.Thread(target=writer)
+        t.start()
+        seen: set[tuple] = set()
+        cursor = None
+        for _ in range(50):
+            page = service.read_change_feed(cursor, 3)
+            for e in page["events"]:
+                self.assertNotIn((e["batch_seq"], e["position"]), seen)
+                seen.add((e["batch_seq"], e["position"]))
+            cursor = page["next_cursor"]
+        stop.set()
+        t.join()
+        # 写入全部完成后继续翻到尾，与全量事件集合逐一对齐
+        while True:
+            page = service.read_change_feed(cursor, 3)
+            for e in page["events"]:
+                self.assertNotIn((e["batch_seq"], e["position"]), seen)
+                seen.add((e["batch_seq"], e["position"]))
+            cursor = page["next_cursor"]
+            if not page["has_more"]:
+                break
+        total = service.read_change_feed(None, 1000)
+        all_keys = {(e["batch_seq"], e["position"]) for e in total["events"]}
+        self.assertEqual(seen, all_keys)
+
+
+class AuditBackfillTests(unittest.TestCase):
+    """升级前已有版本与撤回记录：启动回填从起始游标完整可读、不改原记录。"""
+
+    def test_backfill_legacy_rows_as_singleton_events(self):
+        import sqlite3
+        import tempfile
+        from app.db import _SCHEMA, _connect, _write_lock, backfill_legacy_audit
+
+        path = tempfile.mktemp(prefix="sop-backfill-", suffix=".db")
+        # 模拟"升级前"：旧库只有 procedures/versions/withdrawals。
+        legacy = sqlite3.connect(path)
+        legacy.executescript(
+            """
+            CREATE TABLE procedures (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+            CREATE TABLE versions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                procedure_id INTEGER NOT NULL, revision INTEGER NOT NULL,
+                body TEXT NOT NULL, valid_start TEXT NOT NULL,
+                valid_end TEXT NOT NULL, supersedes_id INTEGER,
+                published_at TEXT NOT NULL,
+                UNIQUE(procedure_id, revision));
+            CREATE TABLE withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version_id INTEGER NOT NULL UNIQUE, withdrawn_at TEXT NOT NULL);
+            """)
+        legacy.execute(
+            "INSERT INTO procedures (number, created_at) VALUES "
+            "('OLD-1','2026-01-01T00:00:00.000000Z'),"
+            "('OLD-2','2026-01-02T00:00:00.000000Z')")
+        legacy.execute(
+            "INSERT INTO versions (procedure_id, revision, body, valid_start, "
+            "valid_end, supersedes_id, published_at) VALUES "
+            "(1,0,'r0','2026-01-01T00:00:00.000000Z',"
+            "'2027-01-01T00:00:00.000000Z',NULL,'2026-01-01T00:00:00.000000Z'),"
+            "(2,0,'r0','2026-01-01T00:00:00.000000Z',"
+            "'2027-01-01T00:00:00.000000Z',NULL,'2026-01-02T00:00:00.000000Z'),"
+            "(1,1,'r1','2026-03-01T00:00:00.000000Z',"
+            "'2026-04-01T00:00:00.000000Z',1,'2026-02-01T00:00:00.000000Z')")
+        legacy.execute(
+            "INSERT INTO withdrawals (version_id, withdrawn_at) "
+            "VALUES (3,'2026-05-01T00:00:00.000000Z')")
+        legacy.commit()
+        legacy.close()
+
+        # settings 为 frozen dataclass：用 object.__setattr__ 临时指向旧库。
+        old_path = settings.db_path
+        try:
+            object.__setattr__(settings, "db_path", path)
+            conn = _connect()
+            try:
+                conn.executescript(_SCHEMA)
+                with _write_lock:
+                    n = backfill_legacy_audit(conn)
+                conn.commit()
+                self.assertEqual(n, 4)
+                # 回填幂等：第二次为空操作
+                self.assertEqual(backfill_legacy_audit(conn), 0)
+            finally:
+                conn.close()
+
+            page = service.read_change_feed(None, 1000)
+            self.assertEqual(
+                [(e["operation"], e["number"], e["revision"])
+                 for e in page["events"]],
+                [("release", "OLD-1", 0),
+                 ("release", "OLD-2", 0),
+                 ("correction", "OLD-1", 1),
+                 ("withdrawal", "OLD-1", 1)])
+            # 每个旧记录都是单事件批次（原请求批次无法事后重建）
+            check = sqlite3.connect(path)
+            try:
+                sizes = [r[0] for r in check.execute(
+                    "SELECT event_count FROM audit_batches ORDER BY seq")]
+                self.assertEqual(sizes, [1, 1, 1, 1])
+                # 原记录未被改写
+                self.assertEqual(check.execute(
+                    "SELECT COUNT(*) FROM versions").fetchone()[0], 3)
+                self.assertEqual(check.execute(
+                    "SELECT COUNT(*) FROM withdrawals").fetchone()[0], 1)
+            finally:
+                check.close()
+            # 升级后新提交的事务正常追加在回填批次之后
+            service.publish_releases([
+                SimpleNamespace(number="NEW-1", body="b",
+                                valid_start=t1, valid_end=t5,
+                                prerequisites=None)])
+            page2 = service.read_change_feed(None, 1000)
+            last = page2["events"][-1]
+            self.assertEqual((last["operation"], last["number"]),
+                             ("release", "NEW-1"))
+            self.assertGreater(int(last["batch_seq"]), 4)
+        finally:
+            object.__setattr__(settings, "db_path", old_path)
+
+    def test_init_db_upgrades_legacy_database(self):
+        import sqlite3
+        import tempfile
+        from app.db import init_db
+
+        path = tempfile.mktemp(prefix="sop-upgrade-", suffix=".db")
+        legacy = sqlite3.connect(path)
+        legacy.executescript(
+            """
+            CREATE TABLE procedures (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+            CREATE TABLE versions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                procedure_id INTEGER NOT NULL, revision INTEGER NOT NULL,
+                body TEXT NOT NULL, valid_start TEXT NOT NULL,
+                valid_end TEXT NOT NULL, supersedes_id INTEGER,
+                published_at TEXT NOT NULL,
+                UNIQUE(procedure_id, revision));
+            CREATE TABLE withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version_id INTEGER NOT NULL UNIQUE, withdrawn_at TEXT NOT NULL);
+            INSERT INTO procedures (number, created_at)
+            VALUES ('UPG-1','2026-01-01T00:00:00.000000Z');
+            INSERT INTO versions (procedure_id, revision, body, valid_start,
+                valid_end, supersedes_id, published_at)
+            VALUES (1,0,'r0','2026-01-01T00:00:00.000000Z',
+                '2027-01-01T00:00:00.000000Z',NULL,
+                '2026-01-01T00:00:00.000000Z');
+            """)
+        legacy.commit()
+        legacy.close()
+
+        old_path = settings.db_path
+        try:
+            object.__setattr__(settings, "db_path", path)
+            init_db()                       # 建表 + 回填
+            init_db()                       # 再启动一次：幂等不重复回填
+            page = service.read_change_feed(None, 10)
+            self.assertEqual(
+                [(e["operation"], e["number"], e["revision"])
+                 for e in page["events"]],
+                [("release", "UPG-1", 0)])
+        finally:
+            object.__setattr__(settings, "db_path", old_path)
 
 
 if __name__ == "__main__":

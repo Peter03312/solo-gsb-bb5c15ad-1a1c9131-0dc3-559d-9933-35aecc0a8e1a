@@ -592,3 +592,64 @@ curl -sS -i -X POST "$BASE_URL/api/v1/corrections/preview" \
            "valid_end":   "2026-12-01T00:00:00Z", "body": "x"}
         ]
       }'; echo
+
+# ------------------------------------------------------------------------
+# 值班审计变动日志（本轮新增）：按提交顺序增量取回全站发布/更正/撤回事件。
+# cursor 为上一页 next_cursor（省略/空/0 为起始游标，含升级前历史）；
+# limit 为每页事件数上限（1..1000，默认 100）。同一新提交批次按请求顺序
+# 排列且不可跨页拆开；游标只随已提交事务前进；空页游标不变。
+# ------------------------------------------------------------------------
+
+# --- 38. 制造提交：单条发布 + 一个批量发布批次（2 事件，请求顺序） --------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-AUDIT-001",
+        "body": "审计演示初版。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{ "items": [
+        {"number": "SOP-AUDIT-002", "body": "批量发布 A。",
+         "valid_start": "2026-01-01T00:00:00Z",
+         "valid_end":   "2027-01-01T00:00:00Z"},
+        {"number": "SOP-AUDIT-003", "body": "批量发布 B。",
+         "valid_start": "2026-01-01T00:00:00Z",
+         "valid_end":   "2027-01-01T00:00:00Z"}
+      ]}'; echo
+
+# --- 39a. 从起始游标整页读取（事件含 operation/number/revision/event_time） -
+curl -sS "$BASE_URL/api/v1/audit/events?cursor=0&limit=100" | python3 -m json.tool
+
+# --- 39b. 只取本批演示规程的事件（用 jq 过滤；无 jq 时直接看完整页） --------
+curl -sS "$BASE_URL/api/v1/audit/events?limit=100" \
+  | jq '.events[] | select(.number | startswith("SOP-AUDIT"))' 2>/dev/null || true
+
+# --- 39c. 持尾游标再读 -> 空页：next_cursor 与传入游标相同 ------------------
+TAIL=$(curl -sS "$BASE_URL/api/v1/audit/events?limit=1000" \
+        | sed -n 's/.*"next_cursor": "\([0-9]*\)".*/\1/p' | tail -1)
+curl -sS "$BASE_URL/api/v1/audit/events?cursor=$TAIL&limit=100"; echo
+
+# --- 40a. limit 装不下下一完整批次 -> 422 page_limit_too_small --------------
+#       （上面的批量发布是 2 事件批次；找到其前一个批次 seq）
+PRIOR=$(curl -sS "$BASE_URL/api/v1/audit/events?limit=1000" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+size={}
+for e in d["events"]:
+    size.setdefault(e["batch_seq"],0)
+    size[e["batch_seq"]]+=1
+two=next(b for b,n in size.items() if n==2)
+print(two-1)')
+curl -sS -i "$BASE_URL/api/v1/audit/events?cursor=$PRIOR&limit=1"; echo
+# --- 40b. 同一游标调大 limit -> 整批返回，不拆开 ----------------------------
+curl -sS "$BASE_URL/api/v1/audit/events?cursor=$PRIOR&limit=10"; echo
+
+# --- 41a. 非法游标（非数字 / 不指向任何已提交批次） -> 422 invalid_cursor ---
+curl -sS -i "$BASE_URL/api/v1/audit/events?cursor=not-a-number"; echo
+curl -sS -i "$BASE_URL/api/v1/audit/events?cursor=99999999"; echo
+# --- 41b. 非法上限（0 / 超过 1000） -> 422 invalid_page_limit ---------------
+curl -sS -i "$BASE_URL/api/v1/audit/events?limit=0"; echo
+curl -sS -i "$BASE_URL/api/v1/audit/events?limit=1001"; echo

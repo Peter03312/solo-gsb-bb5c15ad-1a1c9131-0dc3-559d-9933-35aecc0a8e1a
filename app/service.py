@@ -283,6 +283,32 @@ def _insert_prerequisites(conn: sqlite3.Connection, version_id: int,
             "VALUES (?, ?, ?)", (version_id, pos, number))
 
 
+def _insert_audit_batch(conn: sqlite3.Connection,
+                        entries: list[dict]) -> int:
+    """把一次已提交写事务的全部变动作为**一个批次**写入审计日志。
+
+    必须与业务行在同一条写事务内调用：事务回滚时审计批次一并消失，只读
+    快照因此永远看不到"业务行已落库但审计缺失"或反之的中间状态。批次内
+    事件按 ``entries`` 顺序（即请求顺序）排列。每个 entry 含：
+
+    ``operation``（release/correction/withdrawal）、``number``、``revision``、
+    ``event_time``（该版本的服务端发布时刻，撤回事件为撤回时刻）、
+    ``version_id``（对应 versions 行）。
+    """
+    cur = conn.execute(
+        "INSERT INTO audit_batches (event_count) VALUES (?)",
+        (len(entries),))
+    batch_seq = cur.lastrowid
+    for position, e in enumerate(entries):
+        conn.execute(
+            "INSERT INTO audit_events (batch_seq, position, operation, "
+            "procedure_number, revision, event_time, version_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (batch_seq, position, e["operation"], e["number"],
+             e["revision"], e["event_time"], e["version_id"]))
+    return batch_seq
+
+
 def _prerequisites_of(conn: sqlite3.Connection, version_id: int) -> list[str]:
     """某版本携带的前置规程编号列表（按写入顺序）；无记录即空列表。"""
     rows = conn.execute(
@@ -363,7 +389,16 @@ def publish_releases(items: list) -> dict:
             created.append({"number": number, "revision": 0, "body": body,
                             "valid_start": start, "valid_end": end,
                             "published_at": published_at,
-                            "prerequisites": prerequisites})
+                            "prerequisites": prerequisites,
+                            "_version_id": cur.lastrowid})
+        # 整次批量首次发布作为一个审计批次（同事务，事件按请求顺序）。
+        _insert_audit_batch(conn, [
+            {"operation": "release", "number": e["number"],
+             "revision": e["revision"], "event_time": published_at,
+             "version_id": e["_version_id"]}
+            for e in created])
+    for e in created:
+        e.pop("_version_id", None)
     return {"published_at": published_at, "items": created}
 
 # ---------------------------------------------------------------- 更正提交
@@ -378,8 +413,17 @@ def submit_corrections(items: list) -> dict:
     with write_tx() as conn:
         published_at = _server_now()
         applied = _apply_corrections(conn, items, published_at)
-    # 正式提交的响应形状保持不变：每项回填服务端发布时刻、不带预演用的 index。
-    created = [{k: v for k, v in entry.items() if k != "index"}
+        # 整批更正作为一个审计批次：同批条目按请求顺序、后项可引用前项，
+        # 审计事件顺序与批次内生成顺序一致（与业务行同事务）。
+        _insert_audit_batch(conn, [
+            {"operation": "correction", "number": e["number"],
+             "revision": e["revision"], "event_time": published_at,
+             "version_id": e["_version_id"]}
+            for e in applied])
+    # 正式提交的响应形状保持不变：每项回填服务端发布时刻、不带预演用的 index
+    # 与内部行 id。
+    created = [{k: v for k, v in entry.items()
+                if k not in ("index", "_version_id")}
                | {"published_at": published_at}
               for entry in applied]
     return {"published_at": published_at, "items": created}
@@ -467,7 +511,8 @@ def _apply_corrections(conn: sqlite3.Connection, items: list,
         created.append({"index": i, "number": number, "revision": new_revision,
                         "supersedes_revision": item.base_revision,
                         "body": body, "valid_start": sub[0],
-                        "valid_end": sub[1], "prerequisites": prerequisites})
+                        "valid_end": sub[1], "prerequisites": prerequisites,
+                        "_version_id": cur.lastrowid})
     return created
 
 # ---------------------------------------------------------------- 更正批量预演
@@ -532,9 +577,12 @@ def preview_corrections(items: list, work_start_raw: str,
         finally:
             sim.close()
 
+    # 预演响应不带内部行 id（拟生成行只存在于副本内）。
+    preview_items = [{k: v for k, v in e.items() if k != "_version_id"}
+                     for e in created]
     return {"work_start": work_start, "work_end": work_end,
             "known_as_of": known_as_of, "count": len(created),
-            "items": created, "changes": changes}
+            "items": preview_items, "changes": changes}
 
 
 def _in_memory_clone(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -552,7 +600,8 @@ def _in_memory_clone(conn: sqlite3.Connection) -> sqlite3.Connection:
         clone.execute("PRAGMA foreign_keys = OFF")
         clone.executescript(_SCHEMA)
         tables = ["procedures", "versions", "withdrawals", "packages",
-                  "package_items", "prerequisites"]
+                  "package_items", "prerequisites",
+                  "audit_batches", "audit_events"]
         for table in tables:
             rows = conn.execute(f"SELECT * FROM {table}").fetchall()
             if not rows:
@@ -702,7 +751,18 @@ def withdraw_corrections(items: list) -> dict:
                 "valid_end": version["valid_end"],
                 "published_at": version["published_at"],
                 "withdrawn_at": withdrawn_at,
+                "_version_id": version["id"],
             })
+
+        # 整批撤回作为一个审计批次（事件按请求顺序，与撤回事件行同事务）；
+        # 撤回事件的服务端时刻取 withdrawn_at。
+        _insert_audit_batch(conn, [
+            {"operation": "withdrawal", "number": e["number"],
+             "revision": e["revision"], "event_time": withdrawn_at,
+             "version_id": e["_version_id"]}
+            for e in created])
+        for e in created:
+            e.pop("_version_id", None)
 
     return {"withdrawn_at": withdrawn_at, "items": created}
 
@@ -711,6 +771,100 @@ def _revision_of(conn: sqlite3.Connection, version_id: int) -> int:
     row = conn.execute("SELECT revision FROM versions WHERE id = ?",
                        (version_id,)).fetchone()
     return row["revision"]
+
+# ------------------------------------------------------------ 值班审计变动日志
+
+DEFAULT_FEED_LIMIT = 100
+MAX_FEED_LIMIT = 1000
+
+
+def _parse_cursor(raw: str | None) -> int:
+    """解析不透明游标：省略/空串/0 表示起始游标；否则须为正整数串。"""
+    if raw is None or not str(raw).strip():
+        return 0
+    text = str(raw).strip()
+    if not text.isdigit():
+        raise errors.invalid_cursor(text)
+    value = int(text)
+    if value < 0:                       # isdigit 已挡住负号，防御性保留
+        raise errors.invalid_cursor(text)
+    return value
+
+
+def _parse_feed_limit(raw) -> int:
+    if raw is None:
+        return DEFAULT_FEED_LIMIT
+    text = str(raw).strip()
+    if not text.isdigit() or not (1 <= int(text) <= MAX_FEED_LIMIT):
+        raise errors.invalid_page_limit(text)
+    return int(text)
+
+
+def read_change_feed(cursor_raw: str | None, limit_raw=None) -> dict:
+    """按提交顺序增量取回全站规程变动（值班审计）。
+
+    * ``cursor``：上一页响应的 ``next_cursor``；省略/空/``"0"`` 为起始游标，
+      从升级前已存在的第一条版本/撤回事件开始完整可读。游标只随**已提交**
+      事务（批次）前进——页内每一批都是完整交付，空页保持游标不变。
+    * ``limit``：每页事件数上限（默认 100、最大 1000）。同一新提交批次内的
+      事件按请求顺序排列且**不可跨页拆开**；若游标后的下一批本身大于
+      ``limit``，返回 ``422 page_limit_too_small``（游标不前进、无事件）。
+
+    全程使用进入时固定的只读快照：并发写入或翻页期间的新提交要么整批可见、
+    要么整批不可见，配合单调批次游标，不会重现、不会遗漏。
+    """
+    cursor = _parse_cursor(cursor_raw)
+    limit = _parse_feed_limit(limit_raw)
+
+    with read_snapshot() as conn:
+        if cursor > 0 and conn.execute(
+                "SELECT 1 FROM audit_batches WHERE seq = ?",
+                (cursor,)).fetchone() is None:
+            raise errors.invalid_cursor(str(cursor))
+
+        # 取下一批起的批次序列（快照内一致）；limit+1 用于判定是否还有后续。
+        batches = conn.execute(
+            "SELECT seq, event_count FROM audit_batches WHERE seq > ? "
+            "ORDER BY seq LIMIT ?",
+            (cursor, limit + 1)).fetchall()
+
+        # 同一批次不可拆开：游标后的第一个批次就装不下 -> 明确报错，
+        # 不返回任何事件、游标保持不变。
+        if batches and batches[0]["event_count"] > limit:
+            raise errors.page_limit_too_small(
+                limit, batches[0]["seq"], batches[0]["event_count"])
+
+        included: list[sqlite3.Row] = []
+        used = 0
+        for b in batches:
+            if used + b["event_count"] > limit:
+                break
+            included.append(b)
+            used += b["event_count"]
+        has_more = len(included) < len(batches)
+
+        events: list[dict] = []
+        next_cursor = cursor
+        if included:
+            seqs = [b["seq"] for b in included]
+            placeholders = ",".join("?" * len(seqs))
+            rows = conn.execute(
+                f"SELECT * FROM audit_events WHERE batch_seq IN "
+                f"({placeholders}) ORDER BY batch_seq, position",
+                tuple(seqs)).fetchall()
+            events = [{
+                "operation": r["operation"],
+                "number": r["procedure_number"],
+                "revision": r["revision"],
+                "event_time": r["event_time"],
+                "batch_seq": r["batch_seq"],
+                "position": r["position"],
+            } for r in rows]
+            next_cursor = included[-1]["seq"]
+
+    return {"cursor": str(cursor), "next_cursor": str(next_cursor),
+            "limit": limit, "has_more": has_more,
+            "count": len(events), "events": events}
 
 # ---------------------------------------------------------------- 回溯查询
 
